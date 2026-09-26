@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>硅像素读出板 · 奇偶校验噪声故障定位</title>
+<style>
+  :root {
+    --bg: #0f141a; --panel: #18202b; --line: #2a3646;
+    --fg: #dce6f0; --muted: #8fa0b3; --accent: #4da3ff;
+    --ok: #3fb96b; --bad: #e05d5d; --warn: #e0a13d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.6 "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  header { padding: 18px 28px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 13px; }
+  main { max-width: 1080px; margin: 0 auto; padding: 24px 28px 60px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 20px; margin-bottom: 20px;
+  }
+  .panel h2 { margin: 0 0 12px; font-size: 15px; color: var(--accent); }
+  label { display: block; color: var(--muted); margin: 10px 0 4px; font-size: 13px; }
+  textarea, input[type=text] {
+    width: 100%; background: #0d1319; color: var(--fg);
+    border: 1px solid var(--line); border-radius: 6px; padding: 8px 10px;
+    font: 13px/1.5 ui-monospace, Consolas, monospace;
+  }
+  textarea { min-height: 70px; resize: vertical; }
+  button {
+    background: var(--accent); color: #08131f; border: 0; border-radius: 6px;
+    padding: 9px 18px; font-weight: 600; cursor: pointer; margin-top: 14px;
+  }
+  button.secondary { background: #33414f; color: var(--fg); margin-left: 8px; }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 8px; }
+  th, td {
+    text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line);
+    font-size: 13px; vertical-align: top;
+  }
+  th { color: var(--muted); font-weight: 500; }
+  .check-row input[type=text] { width: 64px; }
+  .check-row .members { flex: 1; }
+  .check-row { display: flex; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .check-row .idx { width: 56px; color: var(--muted); font-size: 12px; }
+  .del { background: transparent; color: var(--bad); margin: 0; padding: 4px 8px; }
+  #errors { border-color: var(--bad); }
+  #errors .err { color: var(--bad); font-size: 13px; margin: 3px 0; }
+  #errors .field { color: var(--warn); font-family: ui-monospace, monospace; }
+  .verdict-ok { color: var(--ok); }
+  .verdict-bad { color: var(--bad); }
+  .badge {
+    display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px;
+  }
+  .badge.pass { background: rgba(63,185,107,.15); color: var(--ok); }
+  .badge.fail { background: rgba(224,93,93,.15); color: var(--bad); }
+  .review-box { display: flex; gap: 10px; align-items: center; }
+  .review-box input { max-width: 260px; }
+  .review-id { font-family: ui-monospace, monospace; color: var(--accent); font-size: 16px; }
+  .chip {
+    display: inline-block; background: rgba(77,163,255,.15); color: var(--accent);
+    border-radius: 4px; padding: 1px 7px; margin: 2px 3px; font-family: ui-monospace, monospace;
+  }
+  .meta { color: var(--muted); font-size: 12px; margin-top: 10px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>硅像素读出板 · 奇偶校验噪声故障定位</h1>
+  <p>折半综合征索引 + 两侧候选精确合并：求满足全部 XOR 约束的最小汉明重量故障向量；同重量按通道标识升序选择向量裁决。</p>
+</header>
+<main>
+  <section class="panel">
+    <h2>1. 通道与校验录入</h2>
+    <label for="channels">通道标识（2–36 个，逗号、空格或换行分隔；须唯一）</label>
+    <textarea id="channels" placeholder="CH00, CH01, CH02 ...&#10;也可每行一个"></textarea>
+
+    <label>奇偶校验（至多 28 条；每条引用非空且互不重复的通道集合）</label>
+    <div id="checks"></div>
+    <button type="button" class="secondary" id="addCheck">+ 添加校验</button>
+
+    <div>
+      <button type="button" id="submitBtn">提交求解</button>
+      <button type="button" class="secondary" id="sampleBtn">填入示例</button>
+    </div>
+    <p class="hint">提交成功后将获得复核编号；刷新页面后可用编号取回故障通道与逐校验复算。输入非法或不可满足时，当前编辑内容会被保留。</p>
+  </section>
+
+  <section class="panel hidden" id="errors">
+    <h2 style="color:var(--bad)">输入被拒绝（未保存记录，编辑内容已保留）</h2>
+    <div id="errorList"></div>
+  </section>
+
+  <section class="panel">
+    <h2>2. 复核</h2>
+    <div class="review-box">
+      <input type="text" id="reviewId" placeholder="输入复核编号">
+      <button type="button" class="secondary" id="loadBtn">按编号取回</button>
+    </div>
+    <div id="result"></div>
+  </section>
+</main>
+<script src="/static/app.js"></script>
+</body>
+</html>

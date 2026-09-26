@@ -1,0 +1,37 @@
+services:
+  app:
+    build: .
+    image: pixel-noise-locator:latest
+    environment:
+      APP_PORT: "8080"
+      APP_DB: /data/locator.db
+    ports:
+      # 宿主机端口可用环境变量 APP_PORT 更改：
+      #   APP_PORT=9090 docker compose up app
+      - "${APP_PORT:-8080}:8080"
+    volumes:
+      - locator-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+  verify:
+    build: .
+    image: pixel-noise-locator:latest
+    environment:
+      APP_URL: http://app:8080
+      APP_DB: /tmp/verify.db
+    depends_on:
+      app:
+        condition: service_healthy
+    # 代码测试 + 构建检查 + 对 app 的 API 冒烟；完成即退出，
+    # 退出码透传给 docker compose（失败时非零）。
+    entrypoint: ["sh", "scripts/verify.sh"]
+    restart: "no"
+
+volumes:
+  locator-data:
