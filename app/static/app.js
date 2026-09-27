@@ -128,8 +128,72 @@ function renderConclusion(data) {
         两侧候选精确合并后无匹配。</p>`;
   }
 
+  html += renderLedger(data);
   resultBox.innerHTML = html;
 }
+
+// ---------- 证据封存账本展示 ----------
+function renderLedger(data) {
+  if (!data.ledger) return "";
+  let html = `
+    <h2 style="font-size:14px;color:var(--accent);margin-top:18px">证据封存账本</h2>
+    <p class="meta">账本序号：<span class="mono">${data.ledger.seq}</span>
+      　叶摘要：<span class="mono">${esc(data.ledger.leaf_digest)}</span></p>`;
+  const seal = data.seal;
+  if (seal) {
+    html += `
+      <p style="margin:8px 0 2px">封存标识 <span class="chip">${esc(seal.seal_id)}</span>
+        ：批次大小 ${seal.size}（连续序号 0–${seal.last_seq}），封存时间 ${esc(seal.created_at || "")}</p>
+      <p style="margin:4px 0">根摘要：<span class="mono">${esc(seal.root)}</span></p>
+      <p style="margin:4px 0">本条复核（叶 #${seal.leaf_index}）的包含路径：</p>`;
+    if (seal.path && seal.path.length) {
+      html += `<ol class="path">`;
+      for (const step of seal.path) {
+        html += `<li><span class="mono">${esc(step.hash)}</span>
+          <span class="meta">（兄弟在${step.pos === "left" ? "左" : "右"}）</span></li>`;
+      }
+      html += `</ol>`;
+    } else {
+      html += `<p class="meta">（单叶批次，路径为空：根摘要即叶哈希）</p>`;
+    }
+    html += `<p class="meta">由叶摘要沿路径逐层 SHA-256（叶 0x00‖摘要，节点 0x01‖左‖右）复算，应等于根摘要。</p>`;
+  } else {
+    html += `<p class="meta">尚未被任何封存覆盖；可在上方输入稳定封存标识发起封存。</p>`;
+  }
+  return html;
+}
+
+// ---------- 发起证据封存 ----------
+document.getElementById("sealBtn").addEventListener("click", async () => {
+  const reviewId = document.getElementById("reviewId").value.trim();
+  const sealId = document.getElementById("sealId").value.trim();
+  if (!reviewId) {
+    showErrors({ errors: [{ field: "review_id", message: "请先提交或取回一条复核" }] });
+    return;
+  }
+  if (!sealId) {
+    showErrors({ errors: [{ field: "seal_id", message: "请输入稳定封存标识" }] });
+    return;
+  }
+  let resp;
+  try {
+    resp = await fetch("/api/seal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ seal_id: sealId, review_id: reviewId }),
+    });
+  } catch (err) {
+    showErrors({ errors: [{ field: "network", message: `请求失败: ${err}` }] });
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    showErrors(data);
+    return;
+  }
+  // 重新取回详情，展示根摘要与本条复核的包含路径。
+  await loadReview(reviewId);
+});
 
 // ---------- 提交 ----------
 document.getElementById("addCheck").addEventListener("click", () => addCheckRow());

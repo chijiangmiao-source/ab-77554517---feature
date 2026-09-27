@@ -60,6 +60,14 @@
   .badge.fail { background: rgba(224,93,93,.15); color: var(--bad); }
   .review-box { display: flex; gap: 10px; align-items: center; }
   .review-box input { max-width: 260px; }
+  .seal-box { display: flex; gap: 10px; align-items: center; margin-top: 10px; }
+  .seal-box input { max-width: 320px; }
+  .mono {
+    font-family: ui-monospace, Consolas, monospace; font-size: 12px;
+    word-break: break-all; color: var(--fg);
+  }
+  .path { margin: 6px 0; padding-left: 22px; }
+  .path li { font-size: 12px; margin: 2px 0; }
   .review-id { font-family: ui-monospace, monospace; color: var(--accent); font-size: 16px; }
   .chip {
     display: inline-block; background: rgba(77,163,255,.15); color: var(--accent);
@@ -102,6 +110,11 @@
       <input type="text" id="reviewId" placeholder="输入复核编号">
       <button type="button" class="secondary" id="loadBtn">按编号取回</button>
     </div>
+    <div class="seal-box">
+      <input type="text" id="sealId" placeholder="稳定封存标识（如批次名）">
+      <button type="button" class="secondary" id="sealBtn">发起证据封存</button>
+    </div>
+    <p class="hint">封存将把该复核及此前全部已保存复核按服务端递增序号固定为一个可验证批次；同一标识同一载荷重传返回原封存。</p>
     <div id="result"></div>
   </section>
 </main>

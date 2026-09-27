@@ -1,14 +1,17 @@
 """Compose verify 使用的 API 冒烟脚本：对运行中的 app 服务发真实请求。
 
 覆盖：健康检查、唯一故障定位、多解同重量裁决、不可行结论持久化、
-非法输入（可定位拒绝）、复核取回。任一步失败以退出码 1 结束。
+非法输入（可定位拒绝）、复核取回、证据封存（创建/重传/冲突/
+包含路径独立复算/非法提交不占账本序号）。任一步失败以退出码 1 结束。
 """
 
+import hashlib
 import json
 import os
 import sys
 import urllib.error
 import urllib.request
+import uuid
 
 BASE = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
 
@@ -32,6 +35,18 @@ def check(name, cond, detail=""):
     print(f"  [{mark}] {name}" + (f" -- {detail}" if detail and not cond else ""))
     if not cond:
         raise SystemExit(f"冒烟失败: {name} {detail}")
+
+
+def recompute_root(leaf_digest, path):
+    """客户端独立复算：由叶摘要沿包含路径逐层 SHA-256 折叠到根。"""
+    h = hashlib.sha256(b"\x00" + bytes.fromhex(leaf_digest)).digest()
+    for step in path:
+        sibling = bytes.fromhex(step["hash"])
+        if step["pos"] == "left":
+            h = hashlib.sha256(b"\x01" + sibling + h).digest()
+        else:
+            h = hashlib.sha256(b"\x01" + h + sibling).digest()
+    return h.hex()
 
 
 def main():
@@ -59,6 +74,10 @@ def main():
     check("逐校验复算全部一致",
           all(r["pass"] for r in data["conclusion"]["recompute"]))
     rid_unique = data["review_id"]
+    seq_unique = data["ledger"]["seq"]
+    leaf_unique = data["ledger"]["leaf_digest"]
+    check("合法提交获得账本序号与叶摘要",
+          isinstance(seq_unique, int) and len(leaf_unique) == 64)
 
     # 2. 多解裁决：{a,b,c} 奇偶 1 有三个重量 1 解，
     #    选择向量标准字典序裁决给 c（(0,0,1) 最小）。
@@ -95,6 +114,11 @@ def main():
           status == 200 and got["conclusion"]["feasible"] is False)
 
     # 5. 非法输入：可定位拒绝（重复通道 / 空集合 / 非法奇偶）
+    status, led = call("GET", "/api/ledger")
+    check("账本状态可读且未停摆",
+          status == 200 and led.get("halted") is False, str(led))
+    ledger_size_before_invalid = led["size"]
+
     status, data = call("POST", "/api/submit", {
         "channels": ["a", "b", "a"],
         "checks": [{"channels": [], "parity": 9}],
@@ -117,6 +141,58 @@ def main():
     })
     check("重复校验集合返回 400", status == 400)
     check("重复原因可读", any("重复" in e["message"] for e in data.get("errors", [])))
+
+    status, led = call("GET", "/api/ledger")
+    check("非法提交未占用账本序号",
+          status == 200 and led["size"] == ledger_size_before_invalid,
+          f"before={ledger_size_before_invalid} after={led.get('size')}")
+
+    # 7. 证据封存：锚定连续前缀批次，返回根摘要与包含路径
+    seal_id = "smoke-" + uuid.uuid4().hex[:10]  # 每次运行唯一，兼容持久卷重跑
+    status, seal = call("POST", "/api/seal", {
+        "seal_id": seal_id, "review_id": rid_unique,
+    })
+    check("封存创建 200", status == 200, str(seal))
+    check("封存锚定提交瞬间连续前缀",
+          seal["size"] == seq_unique + 1 and seal["last_seq"] == seq_unique,
+          str(seal.get("size")))
+    check("根摘要为 64 位十六进制",
+          isinstance(seal["root"], str) and len(seal["root"]) == 64
+          and all(c in "0123456789abcdef" for c in seal["root"]))
+    check("包含路径复算到根摘要",
+          recompute_root(leaf_unique, seal["path"]) == seal["root"])
+
+    # 8. 同一标识同一载荷重传 → 返回原封存
+    status, again = call("POST", "/api/seal", {
+        "seal_id": seal_id, "review_id": rid_unique,
+    })
+    check("同标识同载荷重传返回原封存",
+          status == 200 and again["replayed"] is True
+          and again["root"] == seal["root"]
+          and again["created_at"] == seal["created_at"], str(again))
+
+    # 9. 复用标识却改变目标 → 拒绝且已封存根不变
+    status, conflict = call("POST", "/api/seal", {
+        "seal_id": seal_id, "review_id": rid_infeasible,
+    })
+    check("复用标识改变目标返回 409", status == 409, str(status))
+    check("冲突响应含原封存根",
+          conflict.get("existing", {}).get("root") == seal["root"], str(conflict))
+    status, again = call("POST", "/api/seal", {
+        "seal_id": seal_id, "review_id": rid_unique,
+    })
+    check("冲突后原封存根未改变",
+          status == 200 and again["root"] == seal["root"])
+
+    # 10. 复核详情：账本位置、根摘要与本条复核的包含路径
+    status, got = call("GET", f"/api/review/{rid_unique}")
+    check("详情含账本序号与叶摘要",
+          status == 200 and got["ledger"]["seq"] == seq_unique
+          and got["ledger"]["leaf_digest"] == leaf_unique, str(got.get("ledger")))
+    check("详情含封存根且路径可复算",
+          got["seal"]["root"] == seal["root"]
+          and recompute_root(got["ledger"]["leaf_digest"],
+                             got["seal"]["path"]) == got["seal"]["root"])
 
     print("API 冒烟全部通过")
 
