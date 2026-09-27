@@ -43,6 +43,35 @@ APP_PORT=9090 docker compose up -d app
 
 复核记录持久化在命名卷 `locator-data`（容器内 `/data/locator.db`）。
 
+## 证据封存（只追加账本 + Merkle 前缀批次）
+
+每条合法提交在返回复核编号前，把**排序后的输入、观测与结论的规范
+字节摘要**（确定性 JSON 的 SHA-256）作为账本叶，与复核记录在
+**同一 SQLite 事务**中追加到账本表：账本序号 `seq` 服务端递增、
+连续无断号；非法或失败提交不产生任何记录，也不占用账本序号。
+
+测试工程师可在复核详情中用**稳定封存标识**发起证据封存：
+
+- `POST /api/seal`：`{"seal_id": "...", "review_id": "...",
+  "expected_root": "..."(可选)}`。封存把该复核及此前全部已保存
+  复核（即该复核提交瞬间的连续账本前缀 `1..seq`）固定为一个可
+  验证批次，返回批次大小、**根摘要**与本条复核的**包含路径**。
+  - 同一标识同一载荷重传：返回原封存（`created=false`）；
+  - 复用标识却改变目标或摘要：`409`，已封存根不变。
+- `GET /api/seal/<封存标识>`：取回封存与包含路径。
+- `GET /api/ledger/status`：账本完整性状态（大小、当前根、最早
+  损坏序号）。
+
+哈希方案：叶节点即规范字节摘要；内部节点
+`SHA-256(0x01 || 左 || 右)`；树形按“小于 n 的最大 2 的幂”拆分
+（与 RFC 6962 相同）。包含路径自叶向根给出兄弟子树方位与摘要，
+任何人可用叶摘要沿路径折叠复算根摘要（详情页也会页面内复算）。
+
+**重启完整性**：应用启动时从持久叶记录重建 Merkle 前沿，逐叶重算
+摘要并核对全部封存根；发现断号、叶摘要或根不一致时停止接受新
+复核与新封存（`503`，响应含最早损坏序号 `corrupt_seq`），既有
+复核与封存读取仍可用。
+
 ## verify 服务
 
 ```bash
@@ -50,16 +79,32 @@ docker compose up --build verify
 ```
 
 `verify` 服务对唯一故障、多解裁决、不可行用例运行代码测试
-（`tests/test_solver.py`）与接口测试（`tests/test_api.py`），执行
-字节码构建检查（`compileall`），并对运行中的 `app` 服务做 API 冒烟
-（`tests/smoke_api.py`：健康检查、提交、裁决、不可行持久化、可定位
-拒绝、刷新取回）。全部通过后退出并返回 `0`；任一步失败返回非零码。
+（`tests/test_solver.py`）与接口测试（`tests/test_api.py`、
+`tests/test_ledger.py`），执行字节码构建检查（`compileall`），
+并对运行中的 `app` 服务做 API 冒烟（`tests/smoke_api.py`：健康
+检查、提交、裁决、不可行持久化、可定位拒绝、刷新取回、账本叶
+追加、封存创建/幂等/冲突与包含路径复算）。全部通过后退出并返回
+`0`；任一步失败返回非零码。
+
+### 重启验收
+
+冒烟中的封存检查对重启透明：首次运行以稳定标识
+`compose-acceptance-seal` 创建封存；重启 app 后再次运行时改为
+核对既有封存——对封存前记录取得的包含路径必须仍能复算到相同根。
+
+```bash
+docker compose up -d app
+docker compose up --build verify   # 首次：创建封存
+docker compose restart app         # 重启：启动时重建前沿并核对封存根
+docker compose up --build verify   # 再次：复算封存前记录的路径到相同根
+```
 
 本地不使用 Docker 时也可直接运行（仅需 Python 3.11 标准库）：
 
 ```bash
 python tests/test_solver.py
 python tests/test_api.py
+python tests/test_ledger.py
 APP_DB=/tmp/l.db python app/server.py
 APP_URL=http://127.0.0.1:8080 python tests/smoke_api.py
 ```

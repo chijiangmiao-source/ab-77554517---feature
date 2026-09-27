@@ -9,6 +9,7 @@ set -eu
 echo "== [1/3] 单元与接口测试 =="
 python tests/test_solver.py
 python tests/test_api.py
+python tests/test_ledger.py
 
 echo "== [2/3] 构建检查（字节码编译）=="
 python -m compileall -q app tests

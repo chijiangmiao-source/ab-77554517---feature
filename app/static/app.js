@@ -50,13 +50,24 @@ function collectPayload() {
 const resultBox = document.getElementById("result");
 const errorBox = document.getElementById("errors");
 const errorList = document.getElementById("errorList");
+const sealPanel = document.getElementById("sealPanel");
+const sealLedger = document.getElementById("sealLedger");
+const sealExisting = document.getElementById("sealExisting");
+const sealResult = document.getElementById("sealResult");
+const sealIdInput = document.getElementById("sealId");
+let currentReviewId = null;
 
 function clearEvidence() {
-  // 任何新的提交/取回尝试前，清除上一次的结论与告警，
+  // 任何新的提交/取回尝试前，清除上一次的结论、封存与告警，
   // 但表单编辑内容原样保留。
   resultBox.innerHTML = "";
   errorBox.classList.add("hidden");
   errorList.innerHTML = "";
+  sealPanel.classList.add("hidden");
+  sealLedger.innerHTML = "";
+  sealExisting.innerHTML = "";
+  sealResult.innerHTML = "";
+  currentReviewId = null;
 }
 
 function showErrors(payload) {
@@ -129,6 +140,142 @@ function renderConclusion(data) {
   }
 
   resultBox.innerHTML = html;
+  renderSealArea(data);
+}
+
+// ---------- 证据封存 ----------
+function renderSealArea(data) {
+  currentReviewId = data.review_id;
+  if (data.ledger) {
+    sealLedger.innerHTML =
+      `<p class="meta">账本序号 <strong>#${data.ledger.seq}</strong>` +
+      `（服务端递增、只追加）｜ 叶摘要（排序后输入、观测与结论的规范字节摘要）</p>` +
+      `<p class="meta"><code>${esc(data.ledger.leaf)}</code></p>`;
+  } else {
+    sealLedger.innerHTML = `<p class="meta">该记录尚无账本叶。</p>`;
+  }
+  renderExistingSeals(data.seals || []);
+  sealPanel.classList.remove("hidden");
+}
+
+function renderExistingSeals(seals) {
+  if (!seals.length) {
+    sealExisting.innerHTML = "";
+    return;
+  }
+  let html = `<p class="meta">本复核已锚定的封存（批次 = 该复核提交瞬间的连续账本前缀）：</p>`;
+  for (const s of seals) {
+    html += `<div class="meta">标识 <span class="chip">${esc(s.seal_id)}</span>` +
+      ` 批次大小 ${s.size} ｜ 根 <code>${esc(s.root)}</code>` +
+      ` <button type="button" class="secondary viewSeal" data-seal="${esc(s.seal_id)}"` +
+      ` style="margin:2px 0 2px 8px;padding:3px 10px">查看包含路径</button></div>`;
+  }
+  sealExisting.innerHTML = html;
+  sealExisting.querySelectorAll(".viewSeal").forEach((b) =>
+    b.addEventListener("click", () => loadSeal(b.dataset.seal)));
+}
+
+async function loadSeal(id) {
+  sealResult.innerHTML = "";
+  const resp = await fetch("/api/seal/" + encodeURIComponent(id));
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    sealResult.innerHTML = `<p class="verdict-bad">✗ 封存取回失败</p>`;
+    return;
+  }
+  renderSealProof(data);
+}
+
+document.getElementById("sealBtn").addEventListener("click", async () => {
+  if (!currentReviewId) return;
+  sealResult.innerHTML = "";
+  let resp;
+  try {
+    resp = await fetch("/api/seal", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        seal_id: sealIdInput.value.trim(),
+        review_id: currentReviewId,
+      }),
+    });
+  } catch (err) {
+    sealResult.innerHTML = `<p class="verdict-bad">✗ 请求失败: ${esc(err)}</p>`;
+    return;
+  }
+  const data = await resp.json().catch(() => null);
+  if (!resp.ok) {
+    sealResult.innerHTML =
+      `<p class="verdict-bad">✗ ${esc((data && data.error) || "封存被拒绝")}</p>`;
+    return;
+  }
+  renderSealProof(data);
+  // 刷新“已锚定封存”列表（新建或幂等重传后保持一致）。
+  const r = await fetch("/api/review/" + encodeURIComponent(currentReviewId));
+  const rd = await r.json().catch(() => null);
+  if (r.ok && rd) renderExistingSeals(rd.seals || []);
+});
+
+function hexToBytes(hex) {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+async function foldPath(leafHex, steps) {
+  // 与服务端一致的折叠：节点 = SHA-256(0x01 || 左 || 右)。
+  let acc = hexToBytes(leafHex);
+  for (const st of steps) {
+    const sib = hexToBytes(st.hash);
+    const buf = new Uint8Array(65);
+    buf[0] = 1;
+    if (st.side === "left") {
+      buf.set(sib, 1);
+      buf.set(acc, 33);
+    } else {
+      buf.set(acc, 1);
+      buf.set(sib, 33);
+    }
+    acc = new Uint8Array(await crypto.subtle.digest("SHA-256", buf));
+  }
+  return Array.from(acc).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function renderSealProof(seal) {
+  const steps = seal.path ? seal.path.steps : [];
+  let html =
+    `<p class="verdict-ok" style="font-size:15px">✓ 封存 <strong>${esc(seal.seal_id)}</strong>` +
+    `：批次大小 ${seal.size}，本条复核序号 #${seal.seq}` +
+    `${seal.created === false ? "（同一标识同一载荷，返回原封存）" : ""}</p>` +
+    `<p class="meta">根摘要</p><p style="margin:2px 0"><code>${esc(seal.root)}</code></p>` +
+    `<p class="meta">本条复核的包含路径（自叶向根 ${steps.length} 步）：</p>`;
+  if (seal.path) {
+    html += `<table><thead><tr><th>#</th><th>兄弟方位</th><th>兄弟子树摘要</th></tr></thead><tbody>`;
+    steps.forEach((st, i) => {
+      html += `<tr><td>${i + 1}</td>` +
+        `<td>${st.side === "left" ? "左" : "右"}</td>` +
+        `<td><code>${esc(st.hash)}</code></td></tr>`;
+    });
+    html += `</tbody></table>`;
+  } else {
+    html += `<p class="meta">（账本完整性异常，路径暂不可复算）</p>`;
+  }
+  html += `<div id="sealVerify" class="meta"></div>`;
+  sealResult.innerHTML = html;
+  // 页面内复算：叶摘要沿包含路径折叠应等于根摘要。
+  const box = document.getElementById("sealVerify");
+  if (seal.path && window.crypto && crypto.subtle) {
+    try {
+      const got = await foldPath(seal.leaf, steps);
+      box.innerHTML = got === seal.root
+        ? `<span class="verdict-ok">页面复算 ✓ 路径折叠结果与根摘要一致</span>`
+        : `<span class="verdict-bad">页面复算 ✗ 与根摘要不一致</span>`;
+    } catch (e) {
+      box.textContent = "页面内复算不可用，可凭路径离线核对。";
+    }
+  } else if (seal.path) {
+    box.textContent = "当前环境不支持页面内复算，可凭路径离线核对。";
+  }
 }
 
 // ---------- 提交 ----------

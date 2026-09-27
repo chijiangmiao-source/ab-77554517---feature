@@ -1,9 +1,15 @@
 """Compose verify 使用的 API 冒烟脚本：对运行中的 app 服务发真实请求。
 
 覆盖：健康检查、唯一故障定位、多解同重量裁决、不可行结论持久化、
-非法输入（可定位拒绝）、复核取回。任一步失败以退出码 1 结束。
+非法输入（可定位拒绝）、复核取回、账本叶追加与证据封存
+（创建 / 幂等 / 冲突 / 包含路径复算）。
+
+封存检查对重启透明：首次运行以稳定标识创建封存；`docker compose
+restart app` 后再次运行（重启验收）时，改为核对既有封存——对封存前
+记录取得的包含路径必须仍能复算到相同根。任一步失败以退出码 1 结束。
 """
 
+import hashlib
 import json
 import os
 import sys
@@ -11,6 +17,21 @@ import urllib.error
 import urllib.request
 
 BASE = os.environ.get("APP_URL", "http://app:8080").rstrip("/")
+
+# 跨重启保持稳定的封存标识：首次运行创建，重启后运行据此核对原封存。
+SEAL_ID = "compose-acceptance-seal"
+
+
+def fold_path(leaf_hex, steps):
+    """独立复算：叶摘要沿包含路径折叠（节点 = SHA-256(0x01||左||右)）。"""
+    acc = bytes.fromhex(leaf_hex)
+    for st in steps:
+        sib = bytes.fromhex(st["hash"])
+        if st["side"] == "left":
+            acc = hashlib.sha256(b"\x01" + sib + acc).digest()
+        else:
+            acc = hashlib.sha256(b"\x01" + acc + sib).digest()
+    return acc.hex()
 
 
 def call(method, path, body=None):
@@ -117,6 +138,74 @@ def main():
     })
     check("重复校验集合返回 400", status == 400)
     check("重复原因可读", any("重复" in e["message"] for e in data.get("errors", [])))
+
+    # 7. 账本：合法提交携带账本叶；非法提交夹在中间也不占序号
+    status, d_a = call("POST", "/api/submit", {
+        "channels": ["p", "q"],
+        "checks": [{"channels": ["p", "q"], "parity": 1}],
+    })
+    check("账本提交 A 200", status == 200, str(d_a))
+    check("账本叶为 64 位摘要", len(d_a["ledger"]["leaf"]) == 64)
+    status, _ = call("POST", "/api/submit", {
+        "channels": ["p", "p"],
+        "checks": [{"channels": ["p"], "parity": 2}],
+    })
+    check("夹在中间的非法提交返回 400", status == 400, str(status))
+    status, d_b = call("POST", "/api/submit", {
+        "channels": ["p", "q"],
+        "checks": [{"channels": ["p", "q"], "parity": 1}],
+    })
+    check("账本序号连续（非法提交未占号）",
+          d_b["ledger"]["seq"] == d_a["ledger"]["seq"] + 1,
+          f'{d_a["ledger"]} -> {d_b["ledger"]}')
+
+    # 8. 证据封存：稳定标识幂等锚定；重启后路径仍复算到相同根
+    status, existing = call("GET", f"/api/seal/{SEAL_ID}")
+    if status == 404:
+        # 首次运行：对本运行的唯一故障复核发起封存，并验证幂等重传。
+        status, seal = call("POST", "/api/seal",
+                            {"seal_id": SEAL_ID, "review_id": rid_unique})
+        check("封存创建 200", status == 200, str(seal))
+        check("封存锚定提交瞬间前缀",
+              seal["created"] is True
+              and seal["size"] == seal["seq"]
+              and seal["review_id"] == rid_unique,
+              str(seal))
+        status, again = call("POST", "/api/seal",
+                             {"seal_id": SEAL_ID, "review_id": rid_unique})
+        check("同标识同载荷重传返回原封存",
+              status == 200 and again["created"] is False
+              and again["root"] == seal["root"],
+              str(again))
+        conflict_target = rid_infeasible
+    else:
+        # 重启后运行：原封存必须仍在，目标为重启前保存的复核。
+        check("既有封存可取回", status == 200, str(existing))
+        seal = existing
+        conflict_target = rid_unique  # 本轮新复核 ≠ 原封存目标
+    # 两种情形下：对封存前记录取得的包含路径都必须复算到相同根。
+    check("包含路径复算到相同根",
+          fold_path(seal["leaf"], seal["path"]["steps"]) == seal["root"],
+          seal["root"])
+    # 被封存的复核（重启前保存）仍返回既有最小故障结论
+    status, rec = call("GET", f"/api/review/{seal['review_id']}")
+    check("封存目标复核仍可取回既有结论",
+          status == 200 and rec["conclusion"]["faulty"] == ["CH3"]
+          and any(s["seal_id"] == SEAL_ID for s in rec["seals"]),
+          str(rec.get("conclusion", {})))
+    # 复用标识却改变目标：必须拒绝且不得改变已封存根
+    status, conflict = call("POST", "/api/seal",
+                            {"seal_id": SEAL_ID, "review_id": conflict_target})
+    check("复用标识改目标返回 409", status == 409, str(status))
+    status, after = call("GET", f"/api/seal/{SEAL_ID}")
+    check("冲突后已封存根不变",
+          status == 200 and after["root"] == seal["root"], str(after))
+    check("冲突后路径仍复算到相同根",
+          fold_path(after["leaf"], after["path"]["steps"]) == seal["root"])
+
+    # 9. 账本完整性状态健康
+    status, lst = call("GET", "/api/ledger/status")
+    check("账本状态健康", status == 200 and lst["healthy"] is True, str(lst))
 
     print("API 冒烟全部通过")
 
